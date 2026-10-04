@@ -2,6 +2,8 @@
 
 用 **Python Flask + SQLite + 原生 JavaScript/SVG** 实现的本地审查工具：在画布上录入带**高度层、速度、起降时刻**的航点航段，维护带**生效区间**的禁飞多边形；系统把航段按走廊半宽展开为带时间的**扫掠走廊**，计算与禁飞区的三维冲突（**平面相交 ∩ 高度层重叠 ∩ 时间窗重叠**），给出**首个冲突区间**和**见证位置**；支持拖动航点/禁飞区顶点后自动重算，并可保存/载入命名版本。
 
+此外支持**发布航线**：从任一命名版本取**航线**，配上**当前工作区的禁飞区**重新审查；仅当版本存在、航线含非零长度航段、审查无错误无冲突、且提交时读到的工作区修订号与已发布号未变化时，才原子落库一条**递增发布号**的发布记录（来源版本 ID、组合状态、审查结果快照）。发布记录不可改写：之后编辑工作区或删除来源版本都不影响已发布内容。
+
 ## 一条命令启动
 
 ```bash
@@ -60,6 +62,7 @@ python app.py          # 同样监听 http://localhost:8000
 | 编辑禁飞区 | 点选多边形后，画布上拖动黄色顶点，侧栏改高度/时窗/名称 |
 | 重算 | 任何编辑后自动重算（约 350ms 防抖），也可点「重新审查」 |
 | 保存版本 | 顶部输入版本名（可空，自动用时间戳）→「💾 保存版本」；侧栏可载入/删除 |
+| 发布航线 | 版本列表点「发布」：取该版本航线 + 当前工作区禁飞区重新审查，通过后落库；侧栏「当前发布」查看发布号、来源版本与审查结果 |
 
 首次启动会写入一条演示数据（4 个航点、3 个禁飞区，含平面+高度+时窗命中、高度不命中、时窗不命中三种样例）。
 
@@ -67,16 +70,63 @@ python app.py          # 同样监听 http://localhost:8000
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/state` | 当前工作状态 |
-| PUT | `/api/state` | 保存工作状态（编辑时自动防抖落库） |
+| GET | `/api/state` | 当前工作状态（响应头 `X-Workspace-Rev` 为工作区修订号） |
+| PUT | `/api/state` | 保存工作状态（编辑时自动防抖落库；修订号 +1，响应 `{ok, rev}`） |
 | POST | `/api/analyze` | 提交状态，返回航段时刻、错误、全部冲突条目、首个冲突 |
 | GET | `/api/versions` | 版本列表 |
 | POST | `/api/versions` | 保存命名版本 `{name, state}` |
 | GET/DELETE | `/api/versions/<id>` | 取出版本快照 / 删除 |
+| GET | `/api/release` | 当前发布（发布号、来源版本、组合状态、审查结果）及当前 `workspaceRev`/`releaseSeq` |
+| POST | `/api/release` | 发布航线 `{versionId, workspaceRev, releaseSeq}`，见下文示例 |
+
+### 发布航线（POST /api/release）
+
+请求体三个字段均为整数：`versionId`（来源版本）、`workspaceRev`（读取时的工作区修订号）、`releaseSeq`（读取时的已发布号，从未发布为 `0`）。服务器在**单个事务**内依次校验，任一不满足即整体回滚、**原发布不变**：
+
+| 情形 | 状态码 | 响应 `reason` | 说明 |
+|---|---|---|---|
+| 字段缺失/非整数 | 400 | `missing_fields` | — |
+| 版本不存在或已删除 | 404 | `version_not_found` | — |
+| 工作区或已发布号已变化 | 409 | `stale` | `details` 附 `{expected, actual}` 明细 |
+| 航线没有非零长度航段 | 400 | `no_nonzero_segment` | — |
+| 审查存在错误 | 400 | `analysis_errors` | `errors` 附错误列表 |
+| 审查存在冲突 | 409 | `analysis_conflicts` | `entries`/`first` 附冲突明细 |
+| 通过 | 200 | — | 原子写入 `{ok, release}`，发布号递增 |
+
+发布记录包含递增发布号 `seq`、来源版本 `sourceVersionId`/`sourceVersionName`、组合状态 `state`（版本航线 + 工作区禁飞区）与审查结果 `analysis`，落库后不再被改写。
+
+### 可执行示例（端口 8000）
+
+服务启动后（`docker compose up --build` 或 `python app.py`），依次执行：
+
+```bash
+# ① 保存工作区（本例清空禁飞区；发布用的是“当前工作区”的禁飞区），记下返回的 rev
+curl -s -X PUT http://localhost:8000/api/state \
+  -H 'Content-Type: application/json' \
+  -d '{"route":{"departureTime":"2026-09-24T08:00","unitScale":100,"corridorHalfWidth":0.3,"speeds":[25],"waypoints":[{"id":"w1","x":100,"y":100,"alt":200},{"id":"w2","x":500,"y":100,"alt":200}]},"nfzs":[]}'
+# → {"ok":true,"rev":2}
+
+# ② 保存一个命名版本（发布只取它的“航线”），记下返回的 id
+curl -s -X POST http://localhost:8000/api/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"发布演示","state":{"route":{"departureTime":"2026-09-24T08:00","unitScale":100,"corridorHalfWidth":0.3,"speeds":[25],"waypoints":[{"id":"w1","x":100,"y":100,"alt":200},{"id":"w2","x":500,"y":100,"alt":200}]},"nfzs":[]}}'
+# → {"ok":true,"id":1,"name":"发布演示",...}
+
+# ③ 发布：versionId=②的 id，workspaceRev=①的 rev，releaseSeq=当前已发布号（首次为 0）
+curl -s -X POST http://localhost:8000/api/release \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"workspaceRev":2,"releaseSeq":0}'
+# → {"ok":true,"release":{"seq":1,"sourceVersionId":1,"sourceVersionName":"发布演示",...}}
+
+# ④ 查看当前发布（发布号、来源、组合状态、审查结果）
+curl -s http://localhost:8000/api/release
+```
+
+> 提示：工作区再被编辑后 `workspaceRev` 会变化、每次成功发布后 `releaseSeq` 会递增；用旧值重新发布会得到 `409 {"reason":"stale","details":...}`，先 `GET /api/release` 取最新两个号再重试即可。
 
 ## 回归测试
 
-判定口径（含凹形禁飞区空隙误报、多部件两段命中、时窗截短见证点移动、线/点/时窗端点擦碰）由 `tests/test_analyze.py` 覆盖，仅用标准库 `unittest`：
+判定口径（含凹形禁飞区空隙误报、多部件两段命中、时窗截短见证点移动、线/点/时窗端点擦碰）由 `tests/test_analyze.py` 覆盖；发布航线（组合审查、递增发布号、乐观并发、失败回滚、发布不可变）由 `tests/test_release.py` 覆盖，均仅用标准库 `unittest`：
 
 ```bash
 python3 -m unittest discover -s tests        # 需已 pip install -r requirements.txt
@@ -85,10 +135,11 @@ python3 -m unittest discover -s tests        # 需已 pip install -r requirement
 ## 目录结构
 
 ```
-app.py                 # Flask 后端：SQLite、时窗/高度/平面冲突计算（Shapely）
+app.py                 # Flask 后端：SQLite、时窗/高度/平面冲突计算（Shapely）、发布航线
 tests/test_analyze.py  # 判定口径回归（凹形空隙、两段命中、时窗截断、擦碰）
+tests/test_release.py  # 发布航线回归（组合审查、并发回退、不可变性）
 templates/index.html   # 单页布局
-static/app.js          # 原生 JS：SVG 渲染、拖动、绘制、重算、版本
+static/app.js          # 原生 JS：SVG 渲染、拖动、绘制、重算、版本、发布
 static/style.css       # 样式
 Dockerfile             # python:3.12-slim + gunicorn
 docker-compose.yml     # 一条命令启动，端口 8000，卷持久化

@@ -122,6 +122,11 @@ input[type="checkbox"] { accent-color: #2f6df6; }
   background: #23304a; color: #b9c6dd; border: 1px solid #3a4a67;
   border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
 }
+.release-card {
+  background: #18233a; border: 1px solid #2a3a57; border-radius: 7px;
+  padding: 8px; font-size: 12px; margin-top: 6px;
+}
+.release-card .rel-head { font-weight: 700; font-size: 13px; color: #7fd8ff; margin-bottom: 4px; }
 .toast {
   position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
   background: #1e2a40; border: 1px solid #3f557c; color: #d7e0ee;

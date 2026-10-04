@@ -14,6 +14,8 @@ let hover = null;          // 鼠标世界坐标（绘制预览）
 let drag = null;           // 当前拖动
 let analyzeTimer = null, saveTimer = null;
 let panelDirty = true;
+let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
+let currentRelease = null; // 当前发布（GET /api/release）
 
 // ----------------------------------------------------------- 工具
 const $ = (sel) => document.querySelector(sel);
@@ -64,7 +66,9 @@ async function api(path, opts) {
   return res.json();
 }
 async function loadState() {
-  const s = await api("/api/state");
+  const res = await fetch("/api/state");
+  workspaceRev = parseInt(res.headers.get("X-Workspace-Rev") || "0", 10) || 0;
+  const s = await res.json();
   Object.assign(state, s);
   if (!state.route) state.route = { waypoints: [], speeds: [], departureTime: "", corridorHalfWidth: 0.3, unitScale: 100 };
   state.route.waypoints ||= [];
@@ -73,11 +77,14 @@ async function loadState() {
   state.route.corridorHalfWidth ||= 0.3;
   state.nfzs ||= [];
 }
+async function saveStateNow() {
+  clearTimeout(saveTimer);
+  const r = await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
+  if (r && typeof r.rev === "number") workspaceRev = r.rev;
+}
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
-  }, 500);
+  saveTimer = setTimeout(saveStateNow, 500);
 }
 function scheduleAnalyze() {
   clearTimeout(analyzeTimer);
@@ -518,6 +525,97 @@ $("#btnAddNfz").onclick = () => {
   afterStructuralChange();
 };
 
+// ----------------------------------------------------------- 发布
+const esc = (s) => String(s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+async function loadRelease() {
+  try {
+    const r = await api("/api/release");
+    if (r && r.ok) {
+      currentRelease = r.release;
+      if (typeof r.workspaceRev === "number") workspaceRev = r.workspaceRev;
+    }
+  } catch (e) { /* 保持现状 */ }
+  renderRelease();
+}
+
+// err 非空时在发布卡片上方展示最近一次发布失败的原因与明细
+function renderRelease(err) {
+  const box = $("#releaseBox");
+  let html = "";
+  if (err) {
+    html += `<div class="error-line">⚠ 发布失败：${esc(err.error || "未知原因")}</div>`;
+    for (const e of err.errors || []) {
+      html += `<div class="error-line">⚠ ${esc(e.message)}</div>`;
+    }
+    for (const e of err.entries || []) {
+      html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+        ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
+    }
+    if (err.details) {
+      for (const [k, v] of Object.entries(err.details)) {
+        const label = k === "workspaceRev" ? "工作区修订号" : "已发布号";
+        html += `<div class="entry-line">${label}：读取时 ${v.expected} → 当前 ${v.actual}</div>`;
+      }
+    }
+  }
+  if (currentRelease) {
+    const r = currentRelease;
+    const route = (r.analysis && r.analysis.route) || {};
+    html += `<div class="release-card">
+      <div class="rel-head">#${r.seq} ｜ 来源：${esc(r.sourceVersionName)}（版本 ${r.sourceVersionId}）</div>
+      <div class="summary">发布于 ${r.createdAt} ｜ 工作区修订 ${r.workspaceRev}</div>
+      <div class="result-good" style="margin-top:6px">✅ 审查通过：无三维冲突
+        ｜ 总航程 ${route.length ?? "—"} km ｜ 总时长 ${route.durationMinutes ?? "—"} 分钟</div>
+    </div>`;
+  } else {
+    html += `<div class="summary">暂无发布</div>`;
+  }
+  box.innerHTML = html;
+}
+
+async function publishVersion(v) {
+  try {
+    await saveStateNow(); // 先落库，保证发布用的是最新工作区禁飞区与修订号
+  } catch (e) {
+    toast("工作区保存失败，无法发布");
+    return;
+  }
+  let r;
+  try {
+    r = await api("/api/release", {
+      method: "POST",
+      body: JSON.stringify({
+        versionId: v.id,
+        workspaceRev,
+        releaseSeq: currentRelease ? currentRelease.seq : 0,
+      }),
+    });
+  } catch (e) {
+    toast("发布请求失败：" + e);
+    return;
+  }
+  if (r.ok) {
+    currentRelease = r.release;
+    renderRelease();
+    toast(`已发布 #${r.release.seq}（来源：${r.release.sourceVersionName}）`);
+  } else {
+    if (r.reason === "stale") {
+      // 已发布号/工作区已变化：先同步最新状态，再展示失败原因
+      try {
+        const cur = await api("/api/release");
+        if (cur && cur.ok) {
+          currentRelease = cur.release;
+          if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+    renderRelease(r);
+    toast("发布失败：" + (r.error || "未知原因"));
+  }
+}
+
 // ----------------------------------------------------------- 版本
 async function loadVersions() {
   const list = await api("/api/versions");
@@ -528,15 +626,16 @@ async function loadVersions() {
     const item = document.createElement("div");
     item.className = "version-item";
     item.innerHTML = `<div class="vmeta"><div class="vname"></div><div class="vtime"></div></div>
-      <button data-act="load">载入</button><button data-act="del">删除</button>`;
+      <button data-act="pub">发布</button><button data-act="load">载入</button><button data-act="del">删除</button>`;
     item.querySelector(".vname").textContent = v.name;
     item.querySelector(".vtime").textContent = v.createdAt;
+    item.querySelector('[data-act="pub"]').onclick = () => publishVersion(v);
     item.querySelector('[data-act="load"]').onclick = async () => {
       if (!confirm(`载入版本「${v.name}」？当前未另存的内容将被覆盖。`)) return;
       const full = await api(`/api/versions/${v.id}`);
       Object.assign(state, full.state);
       selection = { type: null, id: null };
-      await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
+      await saveStateNow();
       renderPanel(); fitView(); runAnalyze();
       toast("已载入版本 " + v.name);
     };
@@ -561,5 +660,6 @@ $("#btnSaveVer").onclick = async () => {
   renderPanel();
   fitView();
   loadVersions();
+  loadRelease();
   runAnalyze();
 })();

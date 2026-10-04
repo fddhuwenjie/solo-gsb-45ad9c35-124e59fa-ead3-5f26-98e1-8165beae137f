@@ -58,11 +58,24 @@ def init_db():
                payload TEXT NOT NULL
            )"""
     )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS releases(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               created_at TEXT NOT NULL,
+               source_version_id INTEGER NOT NULL,
+               source_version_name TEXT NOT NULL,
+               workspace_rev INTEGER NOT NULL,
+               state TEXT NOT NULL,
+               analysis TEXT NOT NULL
+           )"""
+    )
     if db.execute("SELECT 1 FROM kv WHERE k='state'").fetchone() is None:
         db.execute(
             "INSERT INTO kv(k,v) VALUES('state',?)",
             (json.dumps(SEED_STATE, ensure_ascii=False),),
         )
+    if db.execute("SELECT 1 FROM kv WHERE k='state_rev'").fetchone() is None:
+        db.execute("INSERT INTO kv(k,v) VALUES('state_rev','1')")
     db.commit()
     db.close()
 
@@ -226,6 +239,44 @@ def windows_for_nfz(nfz):
     if st and en and en < st:
         return None, "禁飞区结束时刻早于开始时刻"
     return [(st, en)], None
+
+
+# ---------------------------------------------------------------- 发布辅助
+def workspace_rev(db):
+    """当前工作区修订号：每次 PUT /api/state 递增。"""
+    row = db.execute("SELECT v FROM kv WHERE k='state_rev'").fetchone()
+    return int(row["v"]) if row else 0
+
+
+def current_release_seq(db):
+    """当前已发布号（最新一条发布的 id；从未发布为 0）。"""
+    row = db.execute("SELECT MAX(id) AS m FROM releases").fetchone()
+    return row["m"] or 0
+
+
+def route_has_nonzero_segment(route):
+    """航线是否至少存在一条非零长度航段（相邻航点平面距离 > 0）。"""
+    wps = (route or {}).get("waypoints") or []
+    for a, b in zip(wps, wps[1:]):
+        x0, y0 = to_float(a.get("x")), to_float(a.get("y"))
+        x1, y1 = to_float(b.get("x")), to_float(b.get("y"))
+        if None in (x0, y0, x1, y1):
+            continue
+        if math.hypot(x1 - x0, y1 - y0) > 0:
+            return True
+    return False
+
+
+def release_dict(row):
+    return {
+        "seq": row["id"],
+        "sourceVersionId": row["source_version_id"],
+        "sourceVersionName": row["source_version_name"],
+        "workspaceRev": row["workspace_rev"],
+        "createdAt": row["created_at"],
+        "state": json.loads(row["state"]),
+        "analysis": json.loads(row["analysis"]),
+    }
 
 
 # ---------------------------------------------------------------- 核心分析
@@ -453,8 +504,11 @@ def index():
 
 @app.get("/api/state")
 def get_state():
-    row = get_db().execute("SELECT v FROM kv WHERE k='state'").fetchone()
-    return jsonify(json.loads(row["v"]) if row else {"route": {}, "nfzs": []})
+    db = get_db()
+    row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+    resp = jsonify(json.loads(row["v"]) if row else {"route": {}, "nfzs": []})
+    resp.headers["X-Workspace-Rev"] = str(workspace_rev(db))
+    return resp
 
 
 @app.put("/api/state")
@@ -467,8 +521,12 @@ def put_state():
         "INSERT INTO kv(k,v) VALUES('state',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
         (json.dumps(state, ensure_ascii=False),),
     )
+    db.execute(
+        "INSERT INTO kv(k,v) VALUES('state_rev','2') "
+        "ON CONFLICT(k) DO UPDATE SET v=CAST(CAST(v AS INTEGER)+1 AS TEXT)"
+    )
     db.commit()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "rev": workspace_rev(db)})
 
 
 @app.post("/api/analyze")
@@ -523,6 +581,101 @@ def delete_version(vid):
     db.execute("DELETE FROM versions WHERE id=?", (vid,))
     db.commit()
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------- 发布
+@app.get("/api/release")
+def get_release():
+    """当前发布（最新一条）及当前工作区修订号/已发布号。"""
+    db = get_db()
+    row = db.execute("SELECT * FROM releases ORDER BY id DESC LIMIT 1").fetchone()
+    return jsonify({
+        "ok": True,
+        "workspaceRev": workspace_rev(db),
+        "releaseSeq": current_release_seq(db),
+        "release": release_dict(row) if row else None,
+    })
+
+
+@app.post("/api/release")
+def publish_release():
+    """发布航线：取版本航线 + 当前工作区禁飞区，组合后重新审查。
+
+    提交 {versionId, workspaceRev, releaseSeq}；全部检查在单个 IMMEDIATE
+    事务内完成，任一不满足即整体回滚，原发布保持不变。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        vid = int(body.get("versionId"))
+        ws_rev = int(body.get("workspaceRev"))
+        rel_seq = int(body.get("releaseSeq"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交整数 versionId、workspaceRev、releaseSeq"}), 400
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        vrow = db.execute(
+            "SELECT name,payload FROM versions WHERE id=?", (vid,)
+        ).fetchone()
+        if vrow is None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "version_not_found",
+                            "error": f"版本 {vid} 不存在或已删除"}), 404
+
+        # 乐观并发：提交时读到的工作区修订号/已发布号须与当前一致
+        details = {}
+        cur_rev = workspace_rev(db)
+        if ws_rev != cur_rev:
+            details["workspaceRev"] = {"expected": ws_rev, "actual": cur_rev}
+        cur_seq = current_release_seq(db)
+        if rel_seq != cur_seq:
+            details["releaseSeq"] = {"expected": rel_seq, "actual": cur_seq}
+        if details:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "stale",
+                            "error": "工作区或已发布号已变化，请刷新后重试",
+                            "details": details}), 409
+
+        vstate = json.loads(vrow["payload"])
+        ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        ws_state = json.loads(ws_row["v"]) if ws_row else {}
+        combined = {"route": vstate.get("route") or {},
+                    "nfzs": ws_state.get("nfzs") or []}
+
+        if not route_has_nonzero_segment(combined["route"]):
+            db.rollback()
+            return jsonify({"ok": False, "reason": "no_nonzero_segment",
+                            "error": "航线没有非零长度航段"}), 400
+
+        result = analyze(combined)
+        if result["errors"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_errors",
+                            "error": "审查存在错误，未发布",
+                            "errors": result["errors"]}), 400
+        if result["entries"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_conflicts",
+                            "error": f"审查发现 {len(result['entries'])} 处冲突，未发布",
+                            "entries": result["entries"],
+                            "first": result["first"]}), 409
+
+        created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = db.execute(
+            "INSERT INTO releases(created_at,source_version_id,source_version_name,"
+            "workspace_rev,state,analysis) VALUES(?,?,?,?,?,?)",
+            (created, vid, vrow["name"], cur_rev,
+             json.dumps(combined, ensure_ascii=False),
+             json.dumps(result, ensure_ascii=False)),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = db.execute("SELECT * FROM releases WHERE id=?", (cur.lastrowid,)).fetchone()
+    return jsonify({"ok": True, "release": release_dict(row)})
 
 
 init_db()
