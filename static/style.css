@@ -122,6 +122,11 @@ input[type="checkbox"] { accent-color: #2f6df6; }
   background: #23304a; color: #b9c6dd; border: 1px solid #3a4a67;
   border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer;
 }
+.release-detail {
+  font-size: 11px; color: #b9c6dd; background: #121b2c; border: 1px solid #2a3a57;
+  border-radius: 6px; padding: 6px 8px; margin: -2px 0 6px;
+  white-space: pre-wrap; line-height: 1.7;
+}
 .toast {
   position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
   background: #1e2a40; border: 1px solid #3f557c; color: #d7e0ee;

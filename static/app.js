@@ -73,11 +73,13 @@ async function loadState() {
   state.route.corridorHalfWidth ||= 0.3;
   state.nfzs ||= [];
 }
+async function saveNow() {
+  clearTimeout(saveTimer);
+  await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
+}
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
-  }, 500);
+  saveTimer = setTimeout(saveNow, 500);
 }
 function scheduleAnalyze() {
   clearTimeout(analyzeTimer);
@@ -528,9 +530,11 @@ async function loadVersions() {
     const item = document.createElement("div");
     item.className = "version-item";
     item.innerHTML = `<div class="vmeta"><div class="vname"></div><div class="vtime"></div></div>
+      <button data-act="publish" title="用该版本航线 + 当前工作区禁飞区重新审查并发布">发布</button>
       <button data-act="load">载入</button><button data-act="del">删除</button>`;
     item.querySelector(".vname").textContent = v.name;
     item.querySelector(".vtime").textContent = v.createdAt;
+    item.querySelector('[data-act="publish"]').onclick = () => publishVersion(v);
     item.querySelector('[data-act="load"]').onclick = async () => {
       if (!confirm(`载入版本「${v.name}」？当前未另存的内容将被覆盖。`)) return;
       const full = await api(`/api/versions/${v.id}`);
@@ -554,6 +558,78 @@ $("#btnSaveVer").onclick = async () => {
   if (r.ok) { toast("已保存：" + r.name); $("#verName").value = ""; loadVersions(); }
 };
 
+// ----------------------------------------------------------- 发布
+async function loadReleases() {
+  const meta = await api("/api/releases");
+  $("#releaseMeta").textContent =
+    `当前发布号 #${meta.publishedRev} ｜ 工作区修订 ${meta.workspaceRev}`;
+  const box = $("#releaseList");
+  box.innerHTML = "";
+  if (!meta.releases.length) {
+    box.innerHTML = '<div class="summary">暂无发布记录（在版本列表点「发布」发起）</div>';
+    return;
+  }
+  for (const r of meta.releases) {
+    const item = document.createElement("div");
+    item.className = "version-item";
+    item.innerHTML = `<div class="vmeta"><div class="vname"></div><div class="vtime"></div></div>
+      <button data-act="view">详情</button>`;
+    item.querySelector(".vname").textContent =
+      `#${r.releaseNo} ${r.conflictCount ? "🚫" : "✅"} ${r.sourceVersionName}`;
+    item.querySelector(".vtime").textContent =
+      `${r.createdAt} ｜ 航程 ${r.routeLength ?? "—"}km ｜ ${r.durationMinutes ?? "—"} 分钟`;
+    item.querySelector('[data-act="view"]').onclick = () => toggleReleaseDetail(item, r.releaseNo);
+    box.appendChild(item);
+  }
+}
+
+async function toggleReleaseDetail(item, no) {
+  const old = item.nextElementSibling;
+  if (old && old.classList.contains("release-detail")) { old.remove(); return; }
+  const r = await api(`/api/releases/${no}`);
+  const div = document.createElement("div");
+  div.className = "release-detail";
+  if (r.ok) {
+    const a = r.analysis || {}, route = a.route || {};
+    const errs = (a.errors || []).map((e) => `⚠ ${e.message}`).join("；");
+    div.textContent =
+      `发布号 #${r.releaseNo} ｜ 来源版本 #${r.sourceVersionId}「${r.sourceVersionName}」｜ ${r.createdAt}\n` +
+      `航段距离：${(route.distances || []).map((d) => d + "km").join("，") || "—"} ｜ 总航程 ${route.length ?? "—"}km ｜ 总时长 ${route.durationMinutes ?? "—"} 分钟\n` +
+      `组合时工作区禁飞区 ${(r.state.nfzs || []).length} 个 ｜ 审查：${errs || "无错误"}，冲突 ${(a.entries || []).length} 起`;
+  } else {
+    div.textContent = r.error || "读取失败";
+  }
+  item.after(div);
+}
+
+async function publishVersion(v) {
+  const st = $("#releaseStatus");
+  st.innerHTML = "";
+  // 自动保存是防抖的：先立即落库，保证读到的工作区修订号就是当前内容
+  await saveNow();
+  const meta = await api("/api/releases");
+  const r = await api("/api/releases", {
+    method: "POST",
+    body: JSON.stringify({
+      versionId: v.id, workspaceRev: meta.workspaceRev, publishedRev: meta.publishedRev,
+    }),
+  });
+  if (r.ok) {
+    st.innerHTML = `<div class="result-good">🚀 已发布 #${r.releaseNo}（来源版本「${r.sourceVersionName}」，审查通过）</div>`;
+    toast(`已发布 #${r.releaseNo}`);
+  } else {
+    let html = `<div class="error-line">⛔ ${r.error || "发布失败"}</div>`;
+    for (const e of r.errors || []) html += `<div class="error-line">⚠ ${e.message}</div>`;
+    for (const e of (r.entries || []).slice(0, 20)) {
+      html += `<div class="entry-line first">🚫 ${e.nfzName} · 航段${e.segIndex + 1} · ` +
+        `${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m · ` +
+        `见证 (${e.witness.x},${e.witness.y})</div>`;
+    }
+    st.innerHTML = html;
+  }
+  loadReleases();
+}
+
 // ----------------------------------------------------------- 启动
 (async function init() {
   setMode("select");
@@ -561,5 +637,6 @@ $("#btnSaveVer").onclick = async () => {
   renderPanel();
   fitView();
   loadVersions();
+  loadReleases();
   runAnalyze();
 })();
